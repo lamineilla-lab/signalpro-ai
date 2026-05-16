@@ -7,12 +7,12 @@ from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
 from openai import OpenAI
 
 load_dotenv()
 
-app = FastAPI(title="NAMU SignalPro AI")
+app = FastAPI(title="NAMU SignalPro AI V6")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -22,13 +22,14 @@ SCAN_SYMBOLS = [
     "BNB_USDT", "ADA_USDT", "LINK_USDT", "AVAX_USDT", "SUI_USDT",
     "ENA_USDT", "RSR_USDT", "PEPE_USDT", "WIF_USDT", "TON_USDT",
     "OP_USDT", "ARB_USDT", "APT_USDT", "NEAR_USDT", "INJ_USDT",
-    "FET_USDT", "SEI_USDT", "TIA_USDT", "LTC_USDT", "BCH_USDT"
+    "FET_USDT", "SEI_USDT", "TIA_USDT", "LTC_USDT", "BCH_USDT",
+    "ORDI_USDT", "FIL_USDT", "DOT_USDT", "TRX_USDT", "UNI_USDT"
 ]
 
 
 def get_mexc_klines(symbol: str = "BTC_USDT", interval: str = "Min15"):
     url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}"
-    params = {"interval": interval, "limit": 200}
+    params = {"interval": interval, "limit": 220}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
@@ -56,10 +57,12 @@ def calculate_indicators(df: pd.DataFrame):
     df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
     df["ema20"] = EMAIndicator(close=df["close"], window=20).ema_indicator()
     df["ema50"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
+    df["ema100"] = EMAIndicator(close=df["close"], window=100).ema_indicator()
 
     macd = MACD(close=df["close"])
     df["macd"] = macd.macd()
     df["macd_signal"] = macd.macd_signal()
+    df["macd_diff"] = macd.macd_diff()
 
     atr = AverageTrueRange(
         high=df["high"],
@@ -68,22 +71,32 @@ def calculate_indicators(df: pd.DataFrame):
         window=14,
     )
     df["atr"] = atr.average_true_range()
+
+    bb = BollingerBands(close=df["close"], window=20, window_dev=2)
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
+    df["bb_mid"] = bb.bollinger_mavg()
+
     df["volume_avg20"] = df["volume"].rolling(20).mean()
+    df["change_pct"] = df["close"].pct_change() * 100
 
     return df.dropna()
 
 
 def support_resistance(df: pd.DataFrame):
-    recent = df.tail(50)
+    recent = df.tail(60)
     price = float(df.iloc[-1]["close"])
     support = float(recent["low"].min())
     resistance = float(recent["high"].max())
 
+    distance_support = ((price - support) / price) * 100 if price else 0
+    distance_resistance = ((resistance - price) / price) * 100 if price else 0
+
     return {
         "support": round(support, 6),
         "resistance": round(resistance, 6),
-        "distance_support_pct": round(((price - support) / price) * 100, 2) if price else 0,
-        "distance_resistance_pct": round(((resistance - price) / price) * 100, 2) if price else 0,
+        "distance_support_pct": round(distance_support, 2),
+        "distance_resistance_pct": round(distance_resistance, 2),
     }
 
 
@@ -93,7 +106,9 @@ def volume_analysis(df: pd.DataFrame):
     avg = float(last["volume_avg20"]) if last["volume_avg20"] else 0
     ratio = volume / avg if avg > 0 else 0
 
-    if ratio >= 1.5:
+    if ratio >= 2:
+        status = "très fort"
+    elif ratio >= 1.35:
         status = "fort"
     elif ratio >= 0.8:
         status = "normal"
@@ -113,129 +128,243 @@ def trend_status(df: pd.DataFrame):
     price = float(last["close"])
     ema20 = float(last["ema20"])
     ema50 = float(last["ema50"])
+    ema100 = float(last["ema100"])
 
+    if price > ema20 > ema50 > ema100:
+        return "fortement haussière"
     if price > ema20 > ema50:
         return "haussière"
+    if price < ema20 < ema50 < ema100:
+        return "fortement baissière"
     if price < ema20 < ema50:
         return "baissière"
     return "neutre"
 
 
-def generate_signal(df: pd.DataFrame):
+def market_structure(df: pd.DataFrame):
+    recent = df.tail(20)
+    highs = recent["high"].values
+    lows = recent["low"].values
+
+    higher_high = highs[-1] > highs[-5] > highs[-10]
+    higher_low = lows[-1] > lows[-5] > lows[-10]
+    lower_high = highs[-1] < highs[-5] < highs[-10]
+    lower_low = lows[-1] < lows[-5] < lows[-10]
+
+    if higher_high and higher_low:
+        return "structure haussière"
+    if lower_high and lower_low:
+        return "structure baissière"
+    return "structure mixte"
+
+
+def signal_quality(confidence, risk, mtf_alignment, warnings, volume_status):
+    score = confidence
+
+    if risk == "faible":
+        score += 8
+    elif risk == "élevé":
+        score -= 15
+
+    if mtf_alignment in ["haussier", "baissier"]:
+        score += 10
+    elif mtf_alignment == "mixte":
+        score -= 8
+
+    if volume_status in ["fort", "très fort"]:
+        score += 6
+    elif volume_status == "faible":
+        score -= 10
+
+    if warnings:
+        score -= 10
+
+    if score >= 90:
+        return "Excellent"
+    if score >= 75:
+        return "Bon"
+    if score >= 60:
+        return "Moyen"
+    return "Faible"
+
+
+def generate_signal(df: pd.DataFrame, mtf_alignment: str = "non disponible"):
     last = df.iloc[-1]
 
     price = float(last["close"])
     rsi = float(last["rsi"])
     ema20 = float(last["ema20"])
     ema50 = float(last["ema50"])
+    ema100 = float(last["ema100"])
     macd = float(last["macd"])
     macd_signal = float(last["macd_signal"])
+    macd_diff = float(last["macd_diff"])
     atr = float(last["atr"])
+    bb_high = float(last["bb_high"])
+    bb_low = float(last["bb_low"])
 
     sr = support_resistance(df)
     vol = volume_analysis(df)
     trend = trend_status(df)
+    structure = market_structure(df)
 
     score = 0
+    danger_score = 0
     reasons = []
     warnings = []
 
     if price > ema20 > ema50:
-        score += 30
-        reasons.append("Tendance haussière : prix au-dessus des EMA 20 et 50.")
+        score += 28
+        reasons.append("Prix au-dessus des EMA 20 et 50.")
     elif price < ema20 < ema50:
-        score -= 30
-        reasons.append("Tendance baissière : prix sous les EMA 20 et 50.")
+        score -= 28
+        reasons.append("Prix sous les EMA 20 et 50.")
     else:
-        reasons.append("Tendance neutre ou mal alignée.")
+        reasons.append("EMA non parfaitement alignées.")
 
-    if 45 <= rsi <= 65:
+    if price > ema100 and score > 0:
+        score += 8
+        reasons.append("Prix au-dessus de l’EMA100, tendance de fond positive.")
+    elif price < ema100 and score < 0:
+        score -= 8
+        reasons.append("Prix sous l’EMA100, tendance de fond négative.")
+
+    if 45 <= rsi <= 62:
         score += 12
         reasons.append("RSI dans une zone saine.")
-    elif rsi < 35:
-        score += 10
-        reasons.append("RSI proche d'une zone survendue.")
+    elif 35 <= rsi < 45:
+        score += 5
+        reasons.append("RSI modéré, possible reprise.")
+    elif rsi < 30:
+        score += 8
+        danger_score += 10
+        warnings.append("RSI très bas : possible rebond violent ou chute prolongée.")
+    elif 62 < rsi <= 70:
+        score -= 4
+        warnings.append("RSI un peu haut, attention à l’essoufflement.")
     elif rsi > 70:
         score -= 18
-        reasons.append("RSI en zone surachetée.")
+        danger_score += 20
+        warnings.append("RSI suracheté.")
 
-    if macd > macd_signal:
+    if macd > macd_signal and macd_diff > 0:
         score += 22
-        reasons.append("MACD positif.")
-    else:
+        reasons.append("MACD positif avec histogramme favorable.")
+    elif macd < macd_signal and macd_diff < 0:
         score -= 22
-        reasons.append("MACD négatif.")
+        reasons.append("MACD négatif avec histogramme défavorable.")
+    else:
+        danger_score += 8
+        warnings.append("MACD hésitant.")
 
-    if vol["volume_status"] == "fort":
-        score += 12 if score > 0 else -12 if score < 0 else 0
-        reasons.append("Volume fort : mouvement mieux confirmé.")
+    if vol["volume_status"] == "très fort":
+        score += 16 if score > 0 else -16 if score < 0 else 0
+        reasons.append("Volume très fort : mouvement puissant.")
+    elif vol["volume_status"] == "fort":
+        score += 10 if score > 0 else -10 if score < 0 else 0
+        reasons.append("Volume fort : confirmation correcte.")
     elif vol["volume_status"] == "faible":
-        score = int(score * 0.65)
+        score = int(score * 0.62)
+        danger_score += 25
         warnings.append("Volume faible : risque de faux signal.")
-        reasons.append("Volume faible, confirmation limitée.")
 
-    if sr["distance_resistance_pct"] < 0.8 and score > 0:
-        score -= 25
-        warnings.append("Prix très proche d'une résistance : attention au rejet.")
-    if sr["distance_support_pct"] < 0.8 and score < 0:
-        score += 25
-        warnings.append("Prix très proche d'un support : attention au rebond.")
+    if sr["distance_resistance_pct"] < 0.7 and score > 0:
+        score -= 28
+        danger_score += 25
+        warnings.append("Prix trop proche d’une résistance.")
+    if sr["distance_support_pct"] < 0.7 and score < 0:
+        score += 28
+        danger_score += 25
+        warnings.append("Prix trop proche d’un support.")
+
+    if price >= bb_high and score > 0:
+        score -= 12
+        danger_score += 12
+        warnings.append("Prix proche ou au-dessus de la bande haute de Bollinger.")
+    if price <= bb_low and score < 0:
+        score += 12
+        danger_score += 12
+        warnings.append("Prix proche ou sous la bande basse de Bollinger.")
+
+    if mtf_alignment == "haussier" and score > 0:
+        score += 16
+        reasons.append("Multi-timeframe aligné haussier.")
+    elif mtf_alignment == "baissier" and score < 0:
+        score -= 16
+        reasons.append("Multi-timeframe aligné baissier.")
+    elif mtf_alignment in ["mixte", "neutre"]:
+        danger_score += 12
+        warnings.append("Multi-timeframe pas totalement aligné.")
+
+    if "haussière" in structure and score > 0:
+        score += 8
+    elif "baissière" in structure and score < 0:
+        score -= 8
+    elif structure == "structure mixte":
+        danger_score += 8
 
     if ema50 > price * 3 or ema50 < price / 3:
-        warnings.append("Données possiblement anormales. Vérifie la paire MEXC avant décision.")
+        danger_score += 40
+        warnings.append("Données possiblement anormales. Vérifie la paire MEXC.")
 
-    if score >= 45:
+    if score >= 52:
         signal = "BUY"
-        confidence = min(92, 50 + score)
-        stop_loss = price - atr * 1.5
-        take_profit_1 = price + atr * 2
+        confidence = min(95, 50 + score)
+        stop_loss = price - atr * 1.45
+        take_profit_1 = price + atr * 1.8
         take_profit_2 = price + atr * 3
-    elif score <= -45:
+    elif score <= -52:
         signal = "SELL"
-        confidence = min(92, 50 + abs(score))
-        stop_loss = price + atr * 1.5
-        take_profit_1 = price - atr * 2
+        confidence = min(95, 50 + abs(score))
+        stop_loss = price + atr * 1.45
+        take_profit_1 = price - atr * 1.8
         take_profit_2 = price - atr * 3
     else:
         signal = "WAIT"
-        confidence = max(40, min(65, 50 + abs(score) / 3))
+        confidence = max(40, min(68, 50 + abs(score) / 3))
         stop_loss = None
         take_profit_1 = None
         take_profit_2 = None
 
-    risk_score = 0
-    if vol["volume_status"] == "faible":
-        risk_score += 30
-    if warnings:
-        risk_score += 25
-    if signal == "WAIT":
-        risk_score += 20
     if confidence < 65:
-        risk_score += 20
-    if rsi > 70 or rsi < 30:
-        risk_score += 15
+        danger_score += 15
+    if signal == "WAIT":
+        danger_score += 20
 
-    risk = "élevé" if risk_score >= 60 else "moyen" if risk_score >= 30 else "faible"
+    risk = "élevé" if danger_score >= 55 else "moyen" if danger_score >= 28 else "faible"
+    quality = signal_quality(confidence, risk, mtf_alignment, warnings, vol["volume_status"])
 
     if signal == "BUY":
-        confirmation = f"Attendre une clôture au-dessus de {round(price + atr * 0.25, 6)} avec volume au moins normal."
+        confirmation = f"Entrée possible seulement après clôture au-dessus de {round(price + atr * 0.22, 6)} avec volume normal ou fort."
     elif signal == "SELL":
-        confirmation = f"Attendre une clôture sous {round(price - atr * 0.25, 6)} avec volume au moins normal."
+        confirmation = f"Entrée possible seulement après clôture sous {round(price - atr * 0.22, 6)} avec volume normal ou fort."
     else:
-        confirmation = "Attendre un meilleur alignement EMA/MACD ou une cassure claire."
+        confirmation = "Éviter l’entrée. Attendre cassure claire, volume et alignement multi-timeframe."
+
+    if quality in ["Faible", "Moyen"] or risk == "élevé":
+        decision = "Attendre confirmation"
+    elif signal == "WAIT":
+        decision = "Éviter"
+    else:
+        decision = "Entrée possible"
 
     return {
         "price": round(price, 6),
         "rsi": round(rsi, 2),
         "ema20": round(ema20, 6),
         "ema50": round(ema50, 6),
+        "ema100": round(ema100, 6),
         "macd": round(macd, 6),
         "macd_signal": round(macd_signal, 6),
         "signal": signal,
         "confidence": round(confidence, 2),
         "score": score,
+        "danger_score": danger_score,
         "trend": trend,
+        "structure": structure,
         "risk": risk,
+        "quality": quality,
+        "decision": decision,
         "support": sr["support"],
         "resistance": sr["resistance"],
         "distance_support_pct": sr["distance_support_pct"],
@@ -251,14 +380,9 @@ def generate_signal(df: pd.DataFrame):
     }
 
 
-def analyze_symbol(symbol: str, interval: str):
-    df = get_mexc_klines(symbol=symbol.upper(), interval=interval)
-    df = calculate_indicators(df)
-    return {
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "analysis": generate_signal(df),
-    }
+def quick_trend(symbol: str, interval: str):
+    df = calculate_indicators(get_mexc_klines(symbol, interval))
+    return trend_status(df), generate_signal(df, "non disponible")
 
 
 def multi_timeframe(symbol: str):
@@ -267,20 +391,24 @@ def multi_timeframe(symbol: str):
 
     for tf in frames:
         try:
-            data.append(analyze_symbol(symbol, tf))
+            df = calculate_indicators(get_mexc_klines(symbol, tf))
+            data.append({
+                "interval": tf,
+                "trend": trend_status(df),
+                "raw_score": int(generate_signal(df, "non disponible")["score"]),
+            })
         except Exception:
             pass
 
-    buy_count = sum(1 for x in data if x["analysis"]["signal"] == "BUY")
-    sell_count = sum(1 for x in data if x["analysis"]["signal"] == "SELL")
-    wait_count = sum(1 for x in data if x["analysis"]["signal"] == "WAIT")
+    bullish = sum(1 for x in data if "haussière" in x["trend"] or x["raw_score"] > 35)
+    bearish = sum(1 for x in data if "baissière" in x["trend"] or x["raw_score"] < -35)
 
-    if buy_count >= 2:
+    if bullish >= 2:
         alignment = "haussier"
-    elif sell_count >= 2:
+    elif bearish >= 2:
         alignment = "baissier"
-    elif wait_count >= 2:
-        alignment = "neutre"
+    elif len(data) < 2:
+        alignment = "faible données"
     else:
         alignment = "mixte"
 
@@ -290,42 +418,62 @@ def multi_timeframe(symbol: str):
     }
 
 
-def ai_explanation(symbol: str, interval: str, result: dict, mtf: dict = None):
+def analyze_symbol(symbol: str, interval: str, mtf: dict = None):
+    if mtf is None:
+        mtf = multi_timeframe(symbol)
+
+    df = calculate_indicators(get_mexc_klines(symbol.upper(), interval))
+    result = generate_signal(df, mtf.get("alignment", "non disponible"))
+
+    return {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "analysis": result,
+        "mtf": mtf,
+    }
+
+
+def ai_explanation(symbol: str, interval: str, result: dict, mtf: dict):
     if not client:
         return "Analyse IA indisponible : clé OpenAI non configurée."
 
     prompt = f"""
-Explique ce signal crypto en français simple, court et utile.
+Analyse crypto prudente en français.
 
 Paire: {symbol}
-Timeframe principal: {interval}
+Timeframe: {interval}
 Signal: {result['signal']}
 Confiance: {result['confidence']}%
-Tendance: {result['trend']}
+Qualité: {result['quality']}
+Décision: {result['decision']}
 Risque: {result['risk']}
+Danger score: {result['danger_score']}
+Tendance: {result['trend']}
+Structure: {result['structure']}
+Multi-timeframe: {mtf['alignment']}
 Prix: {result['price']}
 RSI: {result['rsi']}
 Support: {result['support']}
 Résistance: {result['resistance']}
 Volume: {result['volume_status']} x{result['volume_ratio']}
 Confirmation: {result['confirmation']}
-Multi-timeframe: {mtf['alignment'] if mtf else 'non disponible'}
 Raisons: {result['reasons']}
 Avertissements: {result['warnings']}
 
-Réponds avec :
-1. Pourquoi ce signal
+Réponds en 4 points courts :
+1. Lecture du signal
 2. Risque principal
-3. Confirmation à attendre
+3. Confirmation nécessaire
+4. Décision prudente
 """
 
     completion = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
-            {"role": "system", "content": "Tu donnes des analyses trading prudentes, sans promettre de gains."},
+            {"role": "system", "content": "Tu donnes des analyses trading prudentes. Tu ne promets jamais de gains."},
             {"role": "user", "content": prompt},
         ],
-        temperature=0.25,
+        temperature=0.2,
     )
     return completion.choices[0].message.content
 
@@ -338,12 +486,12 @@ def home():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NAMU SignalPro AI</title>
+<title>NAMU SignalPro AI V6</title>
 <style>
 :root{--bg:#050816;--card:rgba(255,255,255,.08);--card2:rgba(255,255,255,.12);--text:#f8fafc;--muted:#94a3b8;--gold:#f5c542;--blue:#38bdf8;--green:#22c55e;--red:#ef4444;--orange:#f97316;--line:rgba(255,255,255,.12)}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;font-family:Arial,Helvetica,sans-serif;color:var(--text);background:radial-gradient(circle at top left,rgba(56,189,248,.24),transparent 35%),radial-gradient(circle at top right,rgba(245,197,66,.18),transparent 30%),linear-gradient(135deg,#020617,#0f172a 55%,#020617)}
-.container{width:100%;max-width:1180px;margin:0 auto;padding:28px 16px 48px}
+.container{width:100%;max-width:1220px;margin:0 auto;padding:28px 16px 48px}
 .header,.card{border:1px solid var(--line);border-radius:28px;background:linear-gradient(135deg,rgba(255,255,255,.12),rgba(255,255,255,.05));box-shadow:0 25px 80px rgba(0,0,0,.35)}
 .header{padding:24px}.card{padding:22px;margin-top:18px}
 .brand{display:flex;align-items:center;gap:14px;margin-bottom:18px}
@@ -359,11 +507,13 @@ button.secondary{background:linear-gradient(135deg,var(--blue),#bae6fd)}button:d
 .signal-box,.scan-top,.demo-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
 .signal{font-size:42px;font-weight:900}.badge{padding:10px 14px;border-radius:999px;font-weight:900;font-size:13px;background:rgba(255,255,255,.1)}
 .buy{color:var(--green)}.sell{color:var(--red)}.wait{color:var(--orange)}
-.metrics,.mini-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.mini-grid{grid-template-columns:repeat(3,1fr)}
+.metrics,.mini-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.mini-grid{grid-template-columns:repeat(4,1fr)}
 .metric,.mini,.scan-item,.trade-item{padding:14px;border-radius:18px;background:var(--card2);border:1px solid rgba(255,255,255,.08)}
 .label{color:var(--muted);font-size:12px;margin-bottom:7px}.value{font-weight:900;font-size:18px;word-break:break-word}
 .analysis{white-space:pre-line;color:#e2e8f0;line-height:1.55;font-size:14px}
 .warning{margin-top:14px;padding:13px;border-radius:16px;background:rgba(249,115,22,.12);border:1px solid rgba(249,115,22,.28);color:#fed7aa;font-size:13px;line-height:1.5}
+.good{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.25);color:#bbf7d0}
+.bad{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.25);color:#fecaca}
 .loading,.error{display:none;margin-top:18px;padding:18px;border-radius:20px}.loading{background:rgba(56,189,248,.10);border:1px solid rgba(56,189,248,.18);color:#bae6fd}.error{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);color:#fecaca}
 .scanner-list,.trade-list{display:grid;gap:12px;margin-top:18px}
 .demo-balance{font-size:32px;font-weight:900;color:var(--gold)}
@@ -374,34 +524,27 @@ button.secondary{background:linear-gradient(135deg,var(--blue),#bae6fd)}button:d
 <body>
 <main class="container">
 <section class="header">
-<div class="brand"><div class="logo">NS</div><div><h1>NAMU SignalPro AI</h1><p class="subtitle">Scanner MEXC intelligent, multi-timeframe, gestion du risque et compte démo fictif.</p></div></div>
-
+<div class="brand"><div class="logo">NS</div><div><h1>NAMU SignalPro AI V6</h1><p class="subtitle">Moteur renforcé : score qualité, danger, décision prudente, multi-timeframe et compte démo.</p></div></div>
 <div class="tabs">
 <button class="tab active" id="tabSingle" onclick="setMode('single')">Analyse simple</button>
 <button class="tab" id="tabScanner" onclick="setMode('scanner')">Scanner MEXC</button>
 <button class="tab" id="tabDemo" onclick="setMode('demo')">Compte Démo</button>
 </div>
-
 <div id="singleControls" class="controls">
 <select id="symbol">
-<option value="BTC_USDT">BTC / USDT</option><option value="ETH_USDT">ETH / USDT</option><option value="SOL_USDT">SOL / USDT</option>
-<option value="XRP_USDT">XRP / USDT</option><option value="DOGE_USDT">DOGE / USDT</option><option value="SUI_USDT">SUI / USDT</option>
-<option value="ENA_USDT">ENA / USDT</option><option value="RSR_USDT">RSR / USDT</option><option value="PEPE_USDT">PEPE / USDT</option>
+<option value="BTC_USDT">BTC / USDT</option><option value="ETH_USDT">ETH / USDT</option><option value="SOL_USDT">SOL / USDT</option><option value="XRP_USDT">XRP / USDT</option><option value="DOGE_USDT">DOGE / USDT</option><option value="SUI_USDT">SUI / USDT</option><option value="ENA_USDT">ENA / USDT</option><option value="RSR_USDT">RSR / USDT</option><option value="PEPE_USDT">PEPE / USDT</option><option value="TON_USDT">TON / USDT</option>
 </select>
 <select id="interval"><option value="Min5">5 minutes</option><option value="Min15" selected>15 minutes</option><option value="Min60">1 heure</option></select>
-<select id="dummy"><option>Mode prudent</option></select>
+<select><option>Mode prudent V6</option></select>
 <button id="analyzeBtn" onclick="analyze()">Analyser</button>
 </div>
-
 <div id="scannerControls" class="controls" style="display:none">
 <select id="scanInterval"><option value="Min5">Scanner 5 minutes</option><option value="Min15" selected>Scanner 15 minutes</option><option value="Min60">Scanner 1 heure</option></select>
 <select id="scanFilter"><option value="ALL">Tous</option><option value="BUY">Top BUY</option><option value="SELL">Top SELL</option><option value="WAIT">WAIT</option></select>
 <select id="minConfidence"><option value="0">Confiance min 0%</option><option value="60">Confiance min 60%</option><option value="70" selected>Confiance min 70%</option><option value="80">Confiance min 80%</option></select>
-<button class="secondary" id="scanBtn" onclick="scanMarket()">Scanner</button>
+<button class="secondary" id="scanBtn" onclick="scanMarket()">Scanner V6</button>
 </div>
-
-<div id="loading" class="loading">Analyse en cours...</div>
-<div id="error" class="error"></div>
+<div id="loading" class="loading">Analyse en cours...</div><div id="error" class="error"></div>
 </section>
 
 <section id="result" class="grid" style="display:none">
@@ -409,9 +552,13 @@ button.secondary{background:linear-gradient(135deg,var(--blue),#bae6fd)}button:d
 <div class="signal-box"><div><div class="label">Signal détecté</div><div id="signal" class="signal">WAIT</div></div><div id="confidence" class="badge">--%</div></div>
 <div class="metrics">
 <div class="metric"><div class="label">Prix</div><div id="price" class="value">--</div></div>
+<div class="metric"><div class="label">Décision</div><div id="decision" class="value">--</div></div>
+<div class="metric"><div class="label">Qualité</div><div id="quality" class="value">--</div></div>
 <div class="metric"><div class="label">Risque</div><div id="risk" class="value">--</div></div>
-<div class="metric"><div class="label">Tendance</div><div id="trend" class="value">--</div></div>
+<div class="metric"><div class="label">Danger score</div><div id="danger" class="value">--</div></div>
 <div class="metric"><div class="label">Multi-timeframe</div><div id="mtf" class="value">--</div></div>
+<div class="metric"><div class="label">Tendance</div><div id="trend" class="value">--</div></div>
+<div class="metric"><div class="label">Structure</div><div id="structure" class="value">--</div></div>
 <div class="metric"><div class="label">RSI</div><div id="rsi" class="value">--</div></div>
 <div class="metric"><div class="label">Volume</div><div id="volumeStatus" class="value">--</div></div>
 <div class="metric"><div class="label">Support</div><div id="support" class="value">--</div></div>
@@ -419,125 +566,40 @@ button.secondary{background:linear-gradient(135deg,var(--blue),#bae6fd)}button:d
 <div class="metric"><div class="label">Stop-loss</div><div id="stopLoss" class="value">--</div></div>
 <div class="metric"><div class="label">TP1 / TP2</div><div id="takeProfit" class="value">--</div></div>
 </div>
-<div class="warning" id="confirmation">--</div>
-<div id="warningBox"></div>
+<div class="warning" id="confirmation">--</div><div id="warningBox"></div>
 <button style="margin-top:14px" onclick="openDemoFromCurrent()">Entrer en démo avec ce signal</button>
 </div>
-<div class="card"><div class="label">Explication IA</div><div id="aiExplanation" class="analysis">--</div><div class="warning">Analyse informative uniquement. Ne risque jamais plus que ce que tu peux perdre.</div></div>
+<div class="card"><div class="label">Explication IA V6</div><div id="aiExplanation" class="analysis">--</div><div class="warning">Analyse informative uniquement. Aucun signal ne garantit un gain.</div></div>
 </section>
 
 <section id="scannerResult" class="card" style="display:none">
-<div class="signal-box"><div><div class="label">Scanner intelligent MEXC</div><div class="value">Top signaux filtrés</div></div><div id="scanCount" class="badge">-- paires</div></div>
+<div class="signal-box"><div><div class="label">Scanner intelligent MEXC V6</div><div class="value">Classement par qualité, confiance et danger</div></div><div id="scanCount" class="badge">-- paires</div></div>
 <div id="scannerList" class="scanner-list"></div>
 </section>
 
 <section id="demoPanel" class="card" style="display:none">
 <div class="demo-top"><div><div class="label">Compte Démo NAMU</div><div id="demoBalance" class="demo-balance">1000 USDT</div></div><button onclick="resetDemo()">Réinitialiser</button></div>
-<div class="metrics">
-<div class="metric"><div class="label">Capital initial</div><div class="value">1000 USDT</div></div>
-<div class="metric"><div class="label">Risque simulé</div><div class="value">2% par trade</div></div>
-<div class="metric"><div class="label">Trades démo</div><div id="tradeCount" class="value">0</div></div>
-<div class="metric"><div class="label">Performance</div><div id="demoPerf" class="value">0 USDT</div></div>
-</div>
-<div id="tradeList" class="trade-list"></div>
-<div class="warning">Le compte démo est fictif et enregistré seulement dans ton navigateur. Il sert à t’entraîner à respecter les signaux, SL et TP.</div>
+<div class="metrics"><div class="metric"><div class="label">Capital initial</div><div class="value">1000 USDT</div></div><div class="metric"><div class="label">Risque simulé</div><div class="value">2% par trade</div></div><div class="metric"><div class="label">Trades</div><div id="tradeCount" class="value">0</div></div><div class="metric"><div class="label">Performance</div><div id="demoPerf" class="value">0 USDT</div></div></div>
+<div id="tradeList" class="trade-list"></div><div class="warning">Compte fictif enregistré localement dans ton navigateur.</div>
 </section>
-
-<div class="footer">NAMU SignalPro AI • V5 • Scanner, multi-timeframe, compte démo • Trading automatique désactivé.</div>
+<div class="footer">NAMU SignalPro AI • V6 • Intelligence renforcée • Trading automatique désactivé.</div>
 </main>
 
 <script>
-let currentSignal=null;
-let demo=JSON.parse(localStorage.getItem("namu_demo")||'{"balance":1000,"trades":[]}');
-
+let currentSignal=null;let demo=JSON.parse(localStorage.getItem("namu_demo")||'{"balance":1000,"trades":[]}');
 function saveDemo(){localStorage.setItem("namu_demo",JSON.stringify(demo))}
 function fmt(v){if(v===null||v===undefined)return"--";if(typeof v==="number")return v.toLocaleString("en-US",{maximumFractionDigits:6});return v}
 function cls(s){return String(s||"WAIT").toLowerCase()}
-function setMode(m){
-["single","scanner","demo"].forEach(x=>document.getElementById("tab"+(x==="single"?"Single":x==="scanner"?"Scanner":"Demo")).classList.remove("active"));
-document.getElementById("tab"+(m==="single"?"Single":m==="scanner"?"Scanner":"Demo")).classList.add("active");
-document.getElementById("singleControls").style.display=m==="single"?"grid":"none";
-document.getElementById("scannerControls").style.display=m==="scanner"?"grid":"none";
-document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";document.getElementById("demoPanel").style.display=m==="demo"?"block":"none";
-if(m==="demo")renderDemo();
-}
+function setMode(m){["Single","Scanner","Demo"].forEach(x=>document.getElementById("tab"+x).classList.remove("active"));document.getElementById("tab"+(m==="single"?"Single":m==="scanner"?"Scanner":"Demo")).classList.add("active");document.getElementById("singleControls").style.display=m==="single"?"grid":"none";document.getElementById("scannerControls").style.display=m==="scanner"?"grid":"none";document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";document.getElementById("demoPanel").style.display=m==="demo"?"block":"none";if(m==="demo")renderDemo()}
 function showLoad(t){document.getElementById("loading").textContent=t;document.getElementById("loading").style.display="block";document.getElementById("error").style.display="none"}
-function hideLoad(){document.getElementById("loading").style.display="none"}
-function showErr(t){document.getElementById("error").textContent=t;document.getElementById("error").style.display="block"}
-
-async function analyze(){
-const symbol=document.getElementById("symbol").value, interval=document.getElementById("interval").value;
-document.getElementById("analyzeBtn").disabled=true;showLoad("Analyse en cours...");
-document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";
-try{
-const r=await fetch(`/api/analyze?symbol=${symbol}&interval=${interval}`); if(!r.ok)throw new Error();
-const data=await r.json(); const a=data.analysis; currentSignal=data;
-document.getElementById("signal").textContent=a.signal;document.getElementById("signal").className="signal "+cls(a.signal);
-document.getElementById("confidence").textContent=`Confiance : ${a.confidence}%`;
-document.getElementById("price").textContent=fmt(a.price);document.getElementById("risk").textContent=a.risk;document.getElementById("trend").textContent=a.trend;
-document.getElementById("mtf").textContent=data.mtf.alignment;document.getElementById("rsi").textContent=fmt(a.rsi);
-document.getElementById("volumeStatus").textContent=`${a.volume_status} x${a.volume_ratio}`;
-document.getElementById("support").textContent=fmt(a.support);document.getElementById("resistance").textContent=fmt(a.resistance);
-document.getElementById("stopLoss").textContent=fmt(a.stop_loss);document.getElementById("takeProfit").textContent=`${fmt(a.take_profit_1)} / ${fmt(a.take_profit_2)}`;
-document.getElementById("confirmation").textContent=a.confirmation;document.getElementById("aiExplanation").textContent=data.ai_explanation||"Analyse IA indisponible.";
-document.getElementById("warningBox").innerHTML=(a.warnings&&a.warnings.length)?`<div class="warning">${a.warnings.join("<br>")}</div>`:"";
-document.getElementById("result").style.display="grid";
-}catch(e){showErr("Impossible de terminer l’analyse. Réessaie dans quelques secondes.")}
-finally{hideLoad();document.getElementById("analyzeBtn").disabled=false}
-}
-
-async function scanMarket(){
-const interval=document.getElementById("scanInterval").value, filter=document.getElementById("scanFilter").value, min=document.getElementById("minConfidence").value;
-document.getElementById("scanBtn").disabled=true;showLoad("Scanner MEXC en cours... 25 paires analysées.");
-document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";
-try{
-const r=await fetch(`/api/scan?interval=${interval}&filter_signal=${filter}&min_confidence=${min}`); if(!r.ok)throw new Error();
-const data=await r.json();document.getElementById("scanCount").textContent=`${data.results.length} paires`;
-document.getElementById("scannerList").innerHTML=data.results.map((item,i)=>{const a=item.analysis;return`
-<div class="scan-item">
-<div class="scan-top"><div><div class="pair">${i+1}. ${item.symbol}</div><div class="label">${item.interval} • MTF ${item.mtf.alignment} • tendance ${a.trend}</div></div><div class="badge ${cls(a.signal)}">${a.signal} • ${a.confidence}%</div></div>
-<div class="mini-grid">
-<div class="mini"><div class="label">Prix</div><div class="value">${fmt(a.price)}</div></div>
-<div class="mini"><div class="label">Risque</div><div class="value">${a.risk}</div></div>
-<div class="mini"><div class="label">RSI</div><div class="value">${fmt(a.rsi)}</div></div>
-<div class="mini"><div class="label">Support</div><div class="value">${fmt(a.support)}</div></div>
-<div class="mini"><div class="label">Résistance</div><div class="value">${fmt(a.resistance)}</div></div>
-<div class="mini"><div class="label">Volume</div><div class="value">${a.volume_status} x${a.volume_ratio}</div></div>
-</div>
-<div class="warning">${a.confirmation}</div>
-<button onclick='demoEnter(${JSON.stringify(item).replaceAll("'","&apos;")})'>Entrer en démo</button>
-</div>`}).join("");
-document.getElementById("scannerResult").style.display="block";
-}catch(e){showErr("Scanner indisponible. Réessaie dans quelques secondes.")}
-finally{hideLoad();document.getElementById("scanBtn").disabled=false}
-}
-
+function hideLoad(){document.getElementById("loading").style.display="none"}function showErr(t){document.getElementById("error").textContent=t;document.getElementById("error").style.display="block"}
+async function analyze(){const symbol=document.getElementById("symbol").value, interval=document.getElementById("interval").value;document.getElementById("analyzeBtn").disabled=true;showLoad("Analyse V6 en cours...");document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";try{const r=await fetch(`/api/analyze?symbol=${symbol}&interval=${interval}`);if(!r.ok)throw new Error();const data=await r.json();const a=data.analysis;currentSignal=data;document.getElementById("signal").textContent=a.signal;document.getElementById("signal").className="signal "+cls(a.signal);document.getElementById("confidence").textContent=`Confiance : ${a.confidence}%`;document.getElementById("price").textContent=fmt(a.price);document.getElementById("decision").textContent=a.decision;document.getElementById("quality").textContent=a.quality;document.getElementById("risk").textContent=a.risk;document.getElementById("danger").textContent=a.danger_score;document.getElementById("mtf").textContent=data.mtf.alignment;document.getElementById("trend").textContent=a.trend;document.getElementById("structure").textContent=a.structure;document.getElementById("rsi").textContent=fmt(a.rsi);document.getElementById("volumeStatus").textContent=`${a.volume_status} x${a.volume_ratio}`;document.getElementById("support").textContent=fmt(a.support);document.getElementById("resistance").textContent=fmt(a.resistance);document.getElementById("stopLoss").textContent=fmt(a.stop_loss);document.getElementById("takeProfit").textContent=`${fmt(a.take_profit_1)} / ${fmt(a.take_profit_2)}`;document.getElementById("confirmation").textContent=a.confirmation;document.getElementById("aiExplanation").textContent=data.ai_explanation||"Analyse IA indisponible.";document.getElementById("warningBox").innerHTML=(a.warnings&&a.warnings.length)?`<div class="warning">${a.warnings.join("<br>")}</div>`:"";document.getElementById("result").style.display="grid"}catch(e){showErr("Impossible de terminer l’analyse. Réessaie dans quelques secondes.")}finally{hideLoad();document.getElementById("analyzeBtn").disabled=false}}
+async function scanMarket(){const interval=document.getElementById("scanInterval").value, filter=document.getElementById("scanFilter").value, min=document.getElementById("minConfidence").value;document.getElementById("scanBtn").disabled=true;showLoad("Scanner V6 en cours... 30 paires analysées.");document.getElementById("result").style.display="none";document.getElementById("scannerResult").style.display="none";try{const r=await fetch(`/api/scan?interval=${interval}&filter_signal=${filter}&min_confidence=${min}`);if(!r.ok)throw new Error();const data=await r.json();document.getElementById("scanCount").textContent=`${data.results.length} paires`;document.getElementById("scannerList").innerHTML=data.results.map((item,i)=>{const a=item.analysis;const box=a.decision==="Entrée possible"?"good":a.risk==="élevé"?"bad":"warning";return`<div class="scan-item"><div class="scan-top"><div><div class="pair">${i+1}. ${item.symbol}</div><div class="label">${item.interval} • MTF ${item.mtf.alignment} • ${a.structure}</div></div><div class="badge ${cls(a.signal)}">${a.signal} • ${a.confidence}%</div></div><div class="mini-grid"><div class="mini"><div class="label">Décision</div><div class="value">${a.decision}</div></div><div class="mini"><div class="label">Qualité</div><div class="value">${a.quality}</div></div><div class="mini"><div class="label">Risque</div><div class="value">${a.risk}</div></div><div class="mini"><div class="label">Danger</div><div class="value">${a.danger_score}</div></div><div class="mini"><div class="label">Prix</div><div class="value">${fmt(a.price)}</div></div><div class="mini"><div class="label">RSI</div><div class="value">${fmt(a.rsi)}</div></div><div class="mini"><div class="label">Volume</div><div class="value">${a.volume_status} x${a.volume_ratio}</div></div><div class="mini"><div class="label">Support/Résistance</div><div class="value">${fmt(a.support)} / ${fmt(a.resistance)}</div></div></div><div class="${box}">${a.confirmation}</div><button onclick='demoEnter(${JSON.stringify(item).replaceAll("'","&apos;")})'>Entrer en démo</button></div>`}).join("");document.getElementById("scannerResult").style.display="block"}catch(e){showErr("Scanner indisponible. Réessaie dans quelques secondes.")}finally{hideLoad();document.getElementById("scanBtn").disabled=false}}
 function openDemoFromCurrent(){if(!currentSignal)return;demoEnter(currentSignal)}
-function demoEnter(item){
-const a=item.analysis;if(a.signal==="WAIT"){alert("Signal WAIT : mieux vaut attendre un meilleur signal.");return}
-const riskAmount=demo.balance*0.02;
-const trade={id:Date.now(),symbol:item.symbol,side:a.signal,entry:a.price,sl:a.stop_loss,tp:a.take_profit_1,risk:riskAmount,status:"OPEN",pnl:0,time:new Date().toLocaleString()};
-demo.trades.unshift(trade);saveDemo();setMode("demo");
-}
-function closeTrade(id,result){
-const t=demo.trades.find(x=>x.id===id);if(!t||t.status!=="OPEN")return;
-if(result==="TP"){t.status="TP";t.pnl=t.risk*2}
-if(result==="SL"){t.status="SL";t.pnl=-t.risk}
-if(result==="MANUAL"){t.status="MANUAL";t.pnl=0}
-demo.balance+=t.pnl;saveDemo();renderDemo();
-}
+function demoEnter(item){const a=item.analysis;if(a.signal==="WAIT"){alert("Signal WAIT : mieux vaut attendre.");return}const riskAmount=demo.balance*.02;const trade={id:Date.now(),symbol:item.symbol,side:a.signal,entry:a.price,sl:a.stop_loss,tp:a.take_profit_1,risk:riskAmount,status:"OPEN",pnl:0,time:new Date().toLocaleString(),quality:a.quality,decision:a.decision};demo.trades.unshift(trade);saveDemo();setMode("demo")}
+function closeTrade(id,result){const t=demo.trades.find(x=>x.id===id);if(!t||t.status!=="OPEN")return;if(result==="TP"){t.status="TP";t.pnl=t.risk*2}if(result==="SL"){t.status="SL";t.pnl=-t.risk}if(result==="MANUAL"){t.status="MANUAL";t.pnl=0}demo.balance+=t.pnl;saveDemo();renderDemo()}
 function resetDemo(){if(confirm("Réinitialiser le compte démo à 1000 USDT ?")){demo={balance:1000,trades:[]};saveDemo();renderDemo()}}
-function renderDemo(){
-document.getElementById("demoBalance").textContent=fmt(demo.balance)+" USDT";
-document.getElementById("tradeCount").textContent=demo.trades.length;
-document.getElementById("demoPerf").textContent=fmt(demo.balance-1000)+" USDT";
-document.getElementById("tradeList").innerHTML=demo.trades.length?demo.trades.map(t=>`
-<div class="trade-item">
-<div class="scan-top"><div><div class="pair">${t.symbol} ${t.side}</div><div class="label">${t.time} • ${t.status}</div></div><div class="badge">${fmt(t.pnl)} USDT</div></div>
-<div class="mini-grid"><div class="mini"><div class="label">Entrée</div><div class="value">${fmt(t.entry)}</div></div><div class="mini"><div class="label">SL</div><div class="value">${fmt(t.sl)}</div></div><div class="mini"><div class="label">TP</div><div class="value">${fmt(t.tp)}</div></div></div>
-${t.status==="OPEN"?`<div class="controls" style="grid-template-columns:1fr 1fr 1fr;margin-top:12px"><button onclick="closeTrade(${t.id},'TP')">TP touché</button><button onclick="closeTrade(${t.id},'SL')">SL touché</button><button onclick="closeTrade(${t.id},'MANUAL')">Clôture manuelle</button></div>`:""}
-</div>`).join(""):"<div class='warning'>Aucun trade démo pour le moment. Entre depuis un signal ou depuis le scanner.</div>";
-}
+function renderDemo(){document.getElementById("demoBalance").textContent=fmt(demo.balance)+" USDT";document.getElementById("tradeCount").textContent=demo.trades.length;document.getElementById("demoPerf").textContent=fmt(demo.balance-1000)+" USDT";document.getElementById("tradeList").innerHTML=demo.trades.length?demo.trades.map(t=>`<div class="trade-item"><div class="scan-top"><div><div class="pair">${t.symbol} ${t.side}</div><div class="label">${t.time} • ${t.status} • ${t.quality||""}</div></div><div class="badge">${fmt(t.pnl)} USDT</div></div><div class="mini-grid"><div class="mini"><div class="label">Entrée</div><div class="value">${fmt(t.entry)}</div></div><div class="mini"><div class="label">SL</div><div class="value">${fmt(t.sl)}</div></div><div class="mini"><div class="label">TP</div><div class="value">${fmt(t.tp)}</div></div><div class="mini"><div class="label">Décision</div><div class="value">${t.decision||"--"}</div></div></div>${t.status==="OPEN"?`<div class="controls" style="grid-template-columns:1fr 1fr 1fr;margin-top:12px"><button onclick="closeTrade(${t.id},'TP')">TP touché</button><button onclick="closeTrade(${t.id},'SL')">SL touché</button><button onclick="closeTrade(${t.id},'MANUAL')">Clôture manuelle</button></div>`:""}</div>`).join(""):"<div class='warning'>Aucun trade démo pour le moment.</div>"}
 window.addEventListener("load",analyze);
 </script>
 </body>
@@ -547,8 +609,8 @@ window.addEventListener("load",analyze);
 
 @app.get("/api/analyze")
 def api_analyze(symbol: str = Query(default="BTC_USDT"), interval: str = Query(default="Min15")):
-    base = analyze_symbol(symbol, interval)
     mtf = multi_timeframe(symbol)
+    base = analyze_symbol(symbol, interval, mtf)
     try:
         explanation = ai_explanation(symbol.upper(), interval, base["analysis"], mtf)
     except Exception:
@@ -556,7 +618,6 @@ def api_analyze(symbol: str = Query(default="BTC_USDT"), interval: str = Query(d
 
     return {
         **base,
-        "mtf": mtf,
         "ai_explanation": explanation,
         "warning": "Analyse informative uniquement. Ce n’est pas un conseil financier.",
     }
@@ -572,8 +633,8 @@ def api_scan(
 
     for symbol in SCAN_SYMBOLS:
         try:
-            item = analyze_symbol(symbol, interval)
-            item["mtf"] = multi_timeframe(symbol)
+            mtf = multi_timeframe(symbol)
+            item = analyze_symbol(symbol, interval, mtf)
 
             if filter_signal != "ALL" and item["analysis"]["signal"] != filter_signal:
                 continue
@@ -585,18 +646,27 @@ def api_scan(
         except Exception:
             continue
 
+    def quality_rank(q):
+        return {"Excellent": 4, "Bon": 3, "Moyen": 2, "Faible": 1}.get(q, 0)
+
     def sort_key(item):
         a = item["analysis"]
-        mtf_bonus = 10 if item["mtf"]["alignment"] in ["haussier", "baissier"] else 0
-        priority = {"BUY": 3, "SELL": 2, "WAIT": 1}.get(a["signal"], 0)
-        return (priority, a["confidence"] + mtf_bonus, abs(a["score"]))
+        decision_bonus = 25 if a["decision"] == "Entrée possible" else 0
+        risk_penalty = 20 if a["risk"] == "élevé" else 0
+        return (
+            quality_rank(a["quality"]),
+            decision_bonus,
+            a["confidence"],
+            -a["danger_score"],
+            -risk_penalty,
+        )
 
     results = sorted(results, key=sort_key, reverse=True)
 
     return {
         "interval": interval,
         "count": len(results),
-        "results": results[:25],
+        "results": results[:30],
     }
 
 

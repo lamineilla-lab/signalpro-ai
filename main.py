@@ -1,9 +1,17 @@
 import requests
 import pandas as pd
 
+from fastapi import FastAPI, Query
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import AverageTrueRange, BollingerBands
+
+
+app = FastAPI(
+    title="MEXC Signal Analyzer",
+    description="Application d'analyse de signaux crypto MEXC",
+    version="1.0.0"
+)
 
 
 DEFAULT_SYMBOLS = [
@@ -71,6 +79,8 @@ def get_mexc_klines(symbol: str = "BTC_USDT", interval: str = "Min15", limit: in
 
 
 def calculate_indicators(df: pd.DataFrame):
+    df = df.copy()
+
     df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
 
     df["ema9"] = EMAIndicator(close=df["close"], window=9).ema_indicator()
@@ -124,7 +134,7 @@ def volume_analysis(df: pd.DataFrame):
     last = df.iloc[-1]
 
     volume = float(last["volume"])
-    avg = float(last["volume_avg20"]) if last["volume_avg20"] else 0
+    avg = float(last["volume_avg20"]) if pd.notna(last["volume_avg20"]) else 0
     ratio = volume / avg if avg > 0 else 0
 
     if ratio >= 2.2:
@@ -169,6 +179,9 @@ def market_structure(df: pd.DataFrame):
     highs = recent["high"].values
     lows = recent["low"].values
 
+    if len(highs) < 12 or len(lows) < 12:
+        return "structure insuffisante"
+
     higher_high = highs[-1] > highs[-6] > highs[-12]
     higher_low = lows[-1] > lows[-6] > lows[-12]
 
@@ -202,8 +215,8 @@ def detect_breakout_rejection(df: pd.DataFrame):
     breakout_up = close > resistance and body_ratio > 0.45
     breakout_down = close < support and body_ratio > 0.45
 
-    rejection_resistance = high >= resistance and close < resistance and close < previous["close"]
-    rejection_support = low <= support and close > support and close > previous["close"]
+    rejection_resistance = high >= resistance and close < resistance and close < float(previous["close"])
+    rejection_support = low <= support and close > support and close > float(previous["close"])
 
     if breakout_up:
         return "cassure haussière"
@@ -295,7 +308,7 @@ def build_trade_plan(price, atr, signal, support, resistance):
     }
 
 
-def estimate_time_to_targets(df: pd.DataFrame, price: float, signal: str, tp1, tp2, sl, confidence: float, volume_ratio: float, mtf_alignment: str):
+def estimate_time_to_targets(df, price, signal, tp1, tp2, sl, confidence, volume_ratio, mtf_alignment):
     if signal == "WAIT" or not tp1 or not tp2 or not sl:
         return {
             "tp1_time": "Non disponible",
@@ -306,7 +319,7 @@ def estimate_time_to_targets(df: pd.DataFrame, price: float, signal: str, tp1, t
 
     recent = df.tail(20).copy()
     recent["abs_move"] = recent["close"].diff().abs()
-    avg_move = float(recent["abs_move"].mean()) if recent["abs_move"].mean() else 0
+    avg_move = float(recent["abs_move"].mean()) if pd.notna(recent["abs_move"].mean()) else 0
 
     if avg_move <= 0:
         return {
@@ -346,14 +359,14 @@ def estimate_time_to_targets(df: pd.DataFrame, price: float, signal: str, tp1, t
         high = int(max(low + 5, estimated_minutes * 1.45))
         return low, high
 
-    tp1_low, tp1_high = candles_to_minutes(distance_tp1)
-    tp2_low, tp2_high = candles_to_minutes(distance_tp2)
-    sl_low, sl_high = candles_to_minutes(distance_sl)
-
     def fmt_time(low, high):
         if high < 60:
             return f"{low} - {high} min"
-        return f"{round(low/60, 1)}h - {round(high/60, 1)}h"
+        return f"{round(low / 60, 1)}h - {round(high / 60, 1)}h"
+
+    tp1_low, tp1_high = candles_to_minutes(distance_tp1)
+    tp2_low, tp2_high = candles_to_minutes(distance_tp2)
+    sl_low, sl_high = candles_to_minutes(distance_sl)
 
     return {
         "tp1_time": fmt_time(tp1_low, tp1_high),
@@ -363,7 +376,7 @@ def estimate_time_to_targets(df: pd.DataFrame, price: float, signal: str, tp1, t
     }
 
 
-def sentiment_from_signal(signal: str, confidence: float, opportunity_score: float, danger_score: float):
+def sentiment_from_signal(signal, confidence, opportunity_score, danger_score):
     base = confidence
 
     if opportunity_score:
@@ -391,7 +404,7 @@ def sentiment_from_signal(signal: str, confidence: float, opportunity_score: flo
     }
 
 
-def generate_signal(df: pd.DataFrame, mtf_alignment: str = "non disponible"):
+def generate_signal(df, mtf_alignment="non disponible"):
     last = df.iloc[-1]
 
     price = float(last["close"])
@@ -669,7 +682,7 @@ def multi_timeframe(symbol: str):
 
     for tf in frames:
         try:
-            df = calculate_indicators(get_mexc_klines(symbol, tf, limit=220))
+            df = calculate_indicators(get_mexc_klines(symbol.upper(), tf, limit=220))
             basic_signal = generate_signal(df, "non disponible")
             data.append({
                 "interval": tf,
@@ -699,21 +712,29 @@ def multi_timeframe(symbol: str):
 
 
 def analyze_symbol(symbol: str, interval: str = "Min15", mtf: dict = None):
+    symbol = symbol.upper()
+
     if mtf is None:
         mtf = multi_timeframe(symbol)
 
-    df = calculate_indicators(get_mexc_klines(symbol.upper(), interval, limit=220))
+    df = calculate_indicators(get_mexc_klines(symbol, interval, limit=220))
     result = generate_signal(df, mtf.get("alignment", "non disponible"))
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "interval": interval,
         "analysis": result,
         "mtf": mtf,
     }
 
 
-def scan_market(interval: str = "Min15", filter_signal: str = "ALL", min_confidence: int = 70, dynamic: bool = True, limit: int = 40):
+def scan_market(
+    interval: str = "Min15",
+    filter_signal: str = "ALL",
+    min_confidence: int = 70,
+    dynamic: bool = True,
+    limit: int = 40
+):
     symbols = get_dynamic_mexc_symbols(limit=limit) if dynamic else DEFAULT_SYMBOLS[:limit]
     results = []
 
@@ -755,3 +776,55 @@ def scan_market(interval: str = "Min15", filter_signal: str = "ALL", min_confide
         "count": len(results),
         "results": results[:limit],
     }
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "message": "MEXC Signal Analyzer API fonctionne correctement",
+        "routes": {
+            "analyze": "/analyze/BTC_USDT",
+            "scan": "/scan",
+            "docs": "/docs"
+        }
+    }
+
+
+@app.get("/analyze/{symbol}")
+def analyze(
+    symbol: str,
+    interval: str = Query("Min15", description="Exemple: Min5, Min15, Min60")
+):
+    try:
+        return analyze_symbol(symbol=symbol, interval=interval)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "symbol": symbol,
+            "interval": interval
+        }
+
+
+@app.get("/scan")
+def scan(
+    interval: str = Query("Min15"),
+    filter_signal: str = Query("ALL"),
+    min_confidence: int = Query(70),
+    dynamic: bool = Query(True),
+    limit: int = Query(40)
+):
+    try:
+        return scan_market(
+            interval=interval,
+            filter_signal=filter_signal,
+            min_confidence=min_confidence,
+            dynamic=dynamic,
+            limit=limit
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
